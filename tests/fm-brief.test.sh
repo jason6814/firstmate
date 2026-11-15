@@ -1691,6 +1691,51 @@ test_crewmate_scaffolds_forbid_pool_administration() {
   pass "fm-brief.sh: every crewmate scaffold forbids administering the shared worktree pool"
 }
 
+# One command waiting on stdin can hang a whole turn while the pane still looks
+# busy, and "done" without counts, paths, or checks cannot be verified. Both
+# crewmate scaffolds carry the discipline from one shared string, numbered after
+# the other shared rules. The secondmate charter has no numbered Rules section,
+# so it carries the same body under its own heading.
+test_crewmate_briefs_carry_execution_discipline() {
+  local home id brief kind count
+  home="$TMP_ROOT/exec-discipline-home"
+  mkdir -p "$home/data"
+
+  for kind in ship scout; do
+    id="brief-exec-discipline-$kind"
+    if [ "$kind" = scout ]; then
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" alpha --scout >/dev/null 2>&1 \
+        || fail "fm-brief.sh --scout exited non-zero"
+    else
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" alpha --mode no-mistakes >/dev/null 2>&1 \
+        || fail "fm-brief.sh --mode no-mistakes exited non-zero"
+    fi
+    brief="$home/data/$id/brief.md"
+    assert_grep "9. Never let a command wait on stdin" "$brief" \
+      "$kind brief did not number the execution-discipline rule after the other shared rules"
+    assert_grep "a heredoc whose closing marker never arrives hangs the whole turn while looking busy" "$brief" \
+      "$kind brief did not explain why a heredoc can hang the turn"
+    assert_grep "Give long-running commands a timeout" "$brief" \
+      "$kind brief did not require a timeout for long-running commands"
+    assert_grep 'Report completion with evidence - counts, paths, checks - not just "done".' "$brief" \
+      "$kind brief did not require evidence on completion"
+    count=$(grep -oF -- "Never let a command wait on stdin" "$brief" | wc -l | tr -d ' ')
+    [ "$count" -eq 1 ] || fail "$kind brief carried the execution-discipline rule $count times, not once"
+  done
+
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-exec-discipline-mate --secondmate --no-projects >/dev/null 2>&1 \
+    || fail "fm-brief.sh --secondmate --no-projects exited non-zero"
+  brief="$home/data/brief-exec-discipline-mate/brief.md"
+  assert_grep "# Execution discipline" "$brief" \
+    "secondmate charter lost the execution-discipline heading"
+  assert_grep "Never let a command wait on stdin" "$brief" \
+    "secondmate charter did not carry the shared execution-discipline body"
+  count=$(grep -oF -- "Never let a command wait on stdin" "$brief" | wc -l | tr -d ' ')
+  [ "$count" -eq 1 ] || fail "secondmate charter carried the execution-discipline rule $count times, not once"
+
+  pass "fm-brief.sh: every generated contract carries the execution discipline once"
+}
+
 test_script_parses
 test_no_heredoc_in_command_substitution
 test_help_includes_entire_header
@@ -1733,3 +1778,4 @@ test_branch_prefix_is_refused_where_it_does_not_apply
 test_branch_prefix_value_is_validated
 test_branch_prefix_command_is_shell_safe
 test_crewmate_scaffolds_forbid_pool_administration
+test_crewmate_briefs_carry_execution_discipline

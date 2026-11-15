@@ -505,6 +505,18 @@ if [ -e "$CONFIG/wait-no-turns" ]; then
   WAIT_BLOCK="$WAIT_SECTION"$'\n\n'
 fi
 
+# One shared string keeps the execution-discipline rule identical wherever it is
+# emitted. Ship and scout briefs number it with their surrounding rules; the
+# secondmate charter has no numbered Rules section, so it carries the same body
+# under its own heading. Keeping the body here, before the secondmate branch,
+# is what lets the charter and both crewmate scaffolds share one owner.
+IFS= read -r -d '' SHARED_EXEC_DISCIPLINE_RULE <<'EOF' || true
+Never let a command wait on stdin: write a script to a file and run it, because a heredoc whose closing marker never arrives hangs the whole turn while looking busy.
+   Give long-running commands a timeout, and report what you are waiting for instead of sitting inside one tool call.
+   Report completion with evidence - counts, paths, checks - not just "done".
+EOF
+SHARED_EXEC_DISCIPLINE_RULE=${SHARED_EXEC_DISCIPLINE_RULE%$'\n'}
+
 if [ "$KIND" = secondmate ]; then
 SECONDMATE_PROJECTS=""
 idx=1
@@ -546,6 +558,9 @@ Do not invent a second delegation system.
 You do not generate your own work.
 Act only on tasks the main firstmate routes to you.
 Never start a survey, audit, or "find improvements" sweep on your own initiative; that is not your job and it is unwanted.
+
+# Execution discipline
+$SHARED_EXEC_DISCIPLINE_RULE
 
 # The captain and the parent channel
 Nobody reads this chat: the captain and the main firstmate see only what is appended to $STATUS_FILE, and a captain-facing sentence that is not appended there has not been sent.
@@ -736,6 +751,7 @@ $CREWMATE_PAUSE_INSTRUCTIONS
    Firstmate's reply normally writes that closing line at answer time; when a blocker or wait clears WITHOUT a firstmate reply, append \`resolved [at=<epoch>]: {how it cleared}\` yourself (same \`[key=<slug>]\` if you opened it with one) as you resume.
 $SHARED_INFRA_RULE
 $SHARED_NO_CD_RULE
+9. $SHARED_EXEC_DISCIPLINE_RULE
 
 $WAIT_BLOCK$INBOX_SECTION
 
@@ -821,6 +837,7 @@ $ASK_USER_BLOCK
    Firstmate's reply normally writes that closing line at answer time; when a blocker or wait clears WITHOUT a firstmate reply, append \`resolved [at=<epoch>]: {how it cleared}\` yourself (same \`[key=<slug>]\` if you opened it with one) as you resume.
 $SHARED_INFRA_RULE
 $SHARED_NO_CD_RULE
+9. $SHARED_EXEC_DISCIPLINE_RULE
 
 $WAIT_BLOCK$INBOX_SECTION
 
