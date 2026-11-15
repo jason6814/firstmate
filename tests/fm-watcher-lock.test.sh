@@ -499,11 +499,13 @@ test_guard_warnings() {
 }
 
 test_lock_single_winner_under_concurrency() {
-  local dir state lockdir marker i pids pid wins
+  local dir state lockdir marker done i pids pid wins
   dir=$(make_case lock-concurrency)
   state="$dir/state"
   lockdir="$state/.contend.lock"
   marker="$dir/wins"
+  done="$dir/done"
+  mkdir "$done"
   : > "$marker"
   pids=
   i=1
@@ -512,11 +514,21 @@ test_lock_single_winner_under_concurrency() {
       . "$1"
       if fm_lock_try_acquire "$2"; then
         printf "%s\n" "$$" >> "$3"
-        # Stay alive so the held lock names a live pid for the whole window;
-        # otherwise a late contender could legitimately reclaim a dead-pid lock.
-        sleep 1
+        # Hold until every other contender has made its one attempt, so the
+        # held lock names a live pid for the whole window. A fixed sleep lets
+        # a late attempt on a slow host reclaim the dead winner and report a
+        # second, legitimate winner.
+        i=0
+        while [ "$i" -lt 600 ]; do
+          entries=("$4"/*)
+          [ -e "${entries[0]}" ] || entries=()
+          [ "${#entries[@]}" -ge 39 ] && break
+          sleep 0.1
+          i=$((i + 1))
+        done
       fi
-    ' _ "$LIB" "$lockdir" "$marker" &
+      : > "$4/$$"
+    ' _ "$LIB" "$lockdir" "$marker" "$done" &
     pids="$pids $!"
     i=$((i + 1))
   done
@@ -545,6 +557,169 @@ test_lock_steals_dead_pid_lock() {
   [ "$newpid" != "$dead" ] || fail "stale dead-pid lock was not replaced (still $dead)"
   [ -n "$newpid" ] || fail "reclaimed lock has no pid recorded"
   pass "dead-pid stale lock is reclaimed by a single acquirer"
+}
+
+# Git for Windows/MSYS publishes locks as real directories because its `ln -s`
+# copies instead of linking. These cases force that platform shape with a fake
+# uname, so the portable path is exercised on Linux CI as well.
+write_msys_uname() {  # <fakebin>
+  local fakebin=$1
+  cat > "$fakebin/uname" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' 'MINGW64_NT-10.0-00000'
+SH
+  chmod +x "$fakebin/uname"
+}
+
+test_lock_directory_publication_single_winner_under_concurrency() {
+  local dir state lockdir fakebin marker done i pids pid wins holder
+  dir=$(make_case lock-directory-concurrency)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  lockdir="$state/.contend.lock"
+  marker="$dir/wins"
+  done="$dir/done"
+  write_msys_uname "$fakebin"
+  mkdir "$done"
+  : > "$marker"
+  pids=
+  i=1
+  while [ "$i" -le 20 ]; do
+    PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" bash -c '
+      . "$1"
+      if fm_lock_try_acquire "$2"; then
+        printf "%s\n" "$$" >> "$3"
+        # Hold until every other contender has made its one attempt; a fixed
+        # hold would let a late attempt on a slow host reclaim a dead pid and
+        # report a second legitimate winner.
+        i=0
+        while [ "$i" -lt 600 ]; do
+          entries=("$4"/*)
+          [ -e "${entries[0]}" ] || entries=()
+          [ "${#entries[@]}" -ge 19 ] && break
+          sleep 0.1
+          i=$((i + 1))
+        done
+      fi
+      : > "$4/$$"
+    ' _ "$LIB" "$lockdir" "$marker" "$done" &
+    pids="$pids $!"
+    i=$((i + 1))
+  done
+  for pid in $pids; do
+    wait "$pid" 2>/dev/null || true
+  done
+  wins=$(awk 'NF { c++ } END { print c + 0 }' "$marker")
+  [ "$wins" -eq 1 ] || fail "portable lock publication produced $wins winners under concurrency"
+  [ -d "$lockdir" ] && [ ! -L "$lockdir" ] \
+    || fail "portable lock publication did not leave a real directory lock"
+  holder=$(sed -n 1p "$marker")
+  [ "$(cat "$lockdir/pid" 2>/dev/null || true)" = "$holder" ] \
+    || fail "portable lock did not record its winner's pid"
+  pass "portable directory publication admits exactly one winner under concurrency"
+}
+
+test_lock_directory_publication_refuses_live_holder_and_recovers_stale() {
+  local dir state lockdir fakebin ready holder holder_pid out newpid i
+  dir=$(make_case lock-directory-live)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  lockdir="$state/.contend.lock"
+  ready="$dir/holder.ready"
+  write_msys_uname "$fakebin"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2"; then
+      cat "$2/pid" > "$3"
+      sleep 30
+    fi
+  ' _ "$LIB" "$lockdir" "$ready" &
+  holder=$!
+  i=0
+  while [ "$i" -lt 100 ] && [ ! -s "$ready" ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -s "$ready" ] || fail "portable lock holder never became ready"
+  holder_pid=$(cat "$ready")
+  [ -d "$lockdir" ] && [ ! -L "$lockdir" ] \
+    || fail "portable lock holder did not publish a real directory lock"
+
+  out=$(PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2"; then echo won; else echo lost; fi
+  ' _ "$LIB" "$lockdir")
+  [ "$out" = lost ] || fail "a second acquisition succeeded while the portable lock holder lived"
+  [ "$(cat "$lockdir/pid" 2>/dev/null || true)" = "$holder_pid" ] \
+    || fail "a refused second acquisition changed the live holder's recorded pid"
+
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  out=$(PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2"; then
+      cat "$2/pid"
+      fm_lock_release "$2"
+    else
+      echo lost
+    fi
+  ' _ "$LIB" "$lockdir")
+  case "$out" in
+    lost) fail "portable lock did not recover after its holder exited" ;;
+  esac
+  newpid=$out
+  [ -n "$newpid" ] || fail "portable stale recovery recorded no pid"
+  [ "$newpid" != "$holder_pid" ] || fail "portable stale recovery kept the dead holder's pid"
+  pass "a live portable-directory holder refuses another acquirer and a dead one is recovered"
+}
+
+test_lock_symlink_copy_falls_back_to_directory_publication() {
+  local dir state lockdir fakebin out
+  dir=$(make_case lock-symlink-copy)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  lockdir="$state/.contend.lock"
+  # Report a platform whose ln is expected to create a symlink, then make ln
+  # copy exactly as Git Bash does. The publication must not accept the copy as
+  # a lock; it must remove it and publish a real directory instead.
+  cat > "$fakebin/uname" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' 'Linux'
+SH
+  cat > "$fakebin/ln" <<'SH'
+#!/usr/bin/env bash
+target=
+link=
+for arg in "$@"; do
+  case "$arg" in
+    -s|-n) ;;
+    *) if [ -z "$target" ]; then target=$arg; else link=$arg; fi ;;
+  esac
+done
+[ -n "$target" ] && [ -n "$link" ] || exit 1
+cp -R "$target" "$link"
+SH
+  chmod +x "$fakebin/uname" "$fakebin/ln"
+  out=$(PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2"; then
+      is_link=no
+      [ -L "$2" ] && is_link=yes
+      printf "won link=%s pid=%s\n" "$is_link" "$(cat "$2/pid" 2>/dev/null || true)"
+      fm_lock_release "$2"
+      [ ! -e "$2" ] || echo residue
+    else
+      echo lost
+    fi
+  ' _ "$LIB" "$lockdir")
+  case "$out" in
+    won\ link=no\ pid=*) ;;
+    *) fail "copying ln was not replaced by a portable directory lock: $out" ;;
+  esac
+  case "$out" in
+    *residue*) fail "portable lock left residue after release: $out" ;;
+  esac
+  pass "a copying ln is never accepted as a lock and falls back to directory publication"
 }
 
 # Start a process that claims each given link lock, then SIGKILL it so every
@@ -2823,6 +2998,9 @@ test_watch_replaced_holder_stands_down_after_successor_exits
 test_guard_warnings
 test_lock_single_winner_under_concurrency
 test_lock_steals_dead_pid_lock
+test_lock_directory_publication_single_winner_under_concurrency
+test_lock_directory_publication_refuses_live_holder_and_recovers_stale
+test_lock_symlink_copy_falls_back_to_directory_publication
 test_lock_stale_steal_single_winner_under_concurrency
 test_lock_reclaims_dead_steal_owner_without_nested_markers
 test_lock_recovers_dead_nested_steal_chain

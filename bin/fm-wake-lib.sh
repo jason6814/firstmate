@@ -662,6 +662,21 @@ fm_lock_points_to_owner() {
   [ "$actual" = "$ownerdir" ]
 }
 
+# True when lock path $1 is the owner record named by $2. A symlink lock
+# points at its separately prepared owner directory; a portable real-directory
+# lock is its own owner record, so only that same directory matches. POSIX
+# symlink callers get exactly the fm_lock_points_to_owner answer they had
+# before.
+fm_lock_owner_matches() {  # <lockdir> <owner>
+  local lockdir=$1 owner=$2
+  [ -n "$owner" ] || return 1
+  if [ -L "$lockdir" ]; then
+    fm_lock_points_to_owner "$lockdir" "$owner"
+    return
+  fi
+  [ -d "$lockdir" ] && [ ! -L "$lockdir" ] && [ "$lockdir" -ef "$owner" ]
+}
+
 fm_lock_discard_owner() {
   local ownerdir=$1
   [ -n "$ownerdir" ] || return 0
@@ -694,7 +709,7 @@ fm_lock_claim_blocked_by_steal() {
   local lockdir=$1 allowed_steal_owner=${2:-} steal
   steal="$lockdir.steal"
   [ -e "$steal" ] || [ -L "$steal" ] || return 1
-  if [ -n "$allowed_steal_owner" ] && fm_lock_points_to_owner "$steal" "$allowed_steal_owner"; then
+  if [ -n "$allowed_steal_owner" ] && fm_lock_owner_matches "$steal" "$allowed_steal_owner"; then
     return 1
   fi
   return 0
@@ -753,8 +768,58 @@ fm_lock_wait_pending_mutation() {
   fi
 }
 
+# Git for Windows/MSYS `ln -s` copies its target and reports success instead of
+# creating a symlink; native symlinks need a Windows privilege this host does
+# not grant, so its copy cannot be turned into a link. Publishing a link there
+# would leave a real directory that readlink cannot resolve. Those hosts use
+# fm_lock_publish_directory instead; every other host keeps the symlink
+# publication exactly as it was.
+_fm_lock_symlink_publish_supported() {
+  case "$_FM_UNAME" in
+    MINGW*|MSYS*) return 1 ;;
+  esac
+  return 0
+}
+
+# Publish a lock as a real directory on hosts where `ln -s` cannot create a
+# usable symlink. `mkdir` is the atomic first-claim primitive on every
+# supported filesystem, so exactly one contender wins the lock name. The pid
+# file is then created with noclobber in a subshell, so a contender that lost
+# the directory race can never overwrite the winner's pid; until it lands the
+# empty directory is a fresh mid-acquire lock that fm_lock_mid_acquire_is_fresh
+# defers to for one freshness window and stale recovery can reclaim after it.
+# The lock directory is its own owner record, so the caller reports it as
+# FM_LOCK_OWNER_DIR. pid-start follows the pid and is best-effort, exactly as in
+# the prepared owner directory the symlink path publishes.
+fm_lock_publish_directory() {  # <lockdir> <prepared-owner-dir> [<allowed-steal-owner>]
+  local lockdir=$1 ownerdir=$2 allowed_steal_owner=${3:-} mypid back
+  fm_current_pid mypid || return 1
+  mkdir "$lockdir" 2>/dev/null || return 1
+  if ! ( set -C; printf '%s\n' "$mypid" > "$lockdir/pid" ) 2>/dev/null; then
+    # Never overwrite a pid another contender published. Only an empty
+    # directory this claim still owns may be removed.
+    if [ ! -e "$lockdir/pid" ] && [ -d "$lockdir" ] && [ ! -L "$lockdir" ]; then
+      fm_lock_remove_path "$lockdir"
+    fi
+    return 1
+  fi
+  if [ -f "$ownerdir/pid-start" ]; then
+    cp "$ownerdir/pid-start" "$lockdir/pid-start" 2>/dev/null || true
+  fi
+  back=$(cat "$lockdir/pid" 2>/dev/null || true)
+  [ "$back" = "$mypid" ] || return 1
+  if fm_lock_claim_blocked_by_steal "$lockdir" "$allowed_steal_owner"; then
+    if [ -d "$lockdir" ] && [ ! -L "$lockdir" ] \
+      && [ "$(cat "$lockdir/pid" 2>/dev/null || true)" = "$mypid" ]; then
+      fm_lock_remove_path "$lockdir"
+    fi
+    return 1
+  fi
+  return 0
+}
+
 fm_lock_try_create() {
-  local lockdir=$1 allowed_steal_owner=${2:-} ownerdir=
+  local lockdir=$1 allowed_steal_owner=${2:-} ownerdir= mypid
   local FM_LOCK_PENDING_PREVIOUS_PID FM_LOCK_PENDING_PID=
   FM_LOCK_OWNER_DIR=
   if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
@@ -790,18 +855,49 @@ fm_lock_try_create() {
     fm_lock_discard_owner "$ownerdir"
     return 1
   fi
-  ln -s "$ownerdir" "$lockdir" 2>/dev/null &
-  FM_LOCK_PENDING_PID=$!
-  if wait "$FM_LOCK_PENDING_PID" && fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
-    if fm_lock_claim "$lockdir" "$ownerdir" "$allowed_steal_owner"; then
-      FM_LOCK_OWNER_DIR=$ownerdir
-      return 0
+  if _fm_lock_symlink_publish_supported; then
+    ln -s "$ownerdir" "$lockdir" 2>/dev/null &
+    FM_LOCK_PENDING_PID=$!
+    if wait "$FM_LOCK_PENDING_PID" && [ -L "$lockdir" ] \
+      && fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
+      if fm_lock_claim "$lockdir" "$ownerdir" "$allowed_steal_owner"; then
+        FM_LOCK_OWNER_DIR=$ownerdir
+        return 0
+      fi
+      if fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
+        rm -f "$lockdir" 2>/dev/null || true
+      fi
+      fm_lock_discard_owner "$ownerdir"
+      return 1
     fi
-    if fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
-      rm -f "$lockdir" 2>/dev/null || true
-    fi
-  else
     fm_lock_remove_stray_owner_link "$lockdir" "$ownerdir"
+    # A copying `ln` (the Git Bash failure mode, or a host whose uname the
+    # platform check does not recognize) leaves a real directory here instead
+    # of a link. Remove it only while it still records this process's pid,
+    # then fall through to the portable publication; never touch a successor's
+    # record.
+    fm_current_pid mypid || {
+      fm_lock_discard_owner "$ownerdir"
+      return 1
+    }
+    if [ -d "$lockdir" ] && [ ! -L "$lockdir" ]; then
+      if [ "$(cat "$lockdir/pid" 2>/dev/null || true)" != "$mypid" ]; then
+        fm_lock_discard_owner "$ownerdir"
+        return 1
+      fi
+      if ! fm_lock_remove_path "$lockdir"; then
+        fm_lock_discard_owner "$ownerdir"
+        return 1
+      fi
+    elif [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
+      fm_lock_discard_owner "$ownerdir"
+      return 1
+    fi
+  fi
+  if fm_lock_publish_directory "$lockdir" "$ownerdir" "$allowed_steal_owner"; then
+    fm_lock_discard_owner "$ownerdir"
+    FM_LOCK_OWNER_DIR=$lockdir
+    return 0
   fi
   fm_lock_discard_owner "$ownerdir"
   return 1
@@ -1589,7 +1685,7 @@ fm_lock_try_acquire() {
     FM_LOCK_OWNER_DIR=
     return 1
   fi
-  if ! fm_lock_points_to_owner "$steal" "$steal_owner"; then
+  if ! fm_lock_owner_matches "$steal" "$steal_owner"; then
     fm_lock_release "$steal"
     FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
     FM_LOCK_OWNER_DIR=

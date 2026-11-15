@@ -20,6 +20,16 @@
 # the path to inspect for contents or permission problems. Live contention has no new
 # deadline. tests/fm-watcher-lock.test.sh covers recovery and refusal.
 #
+# Lock publication is a symlink to a prepared owner directory on POSIX. Git for
+# Windows/MSYS `ln -s` copies its target instead of creating a symlink, so those
+# hosts publish a real lock directory with mkdir, which is atomic on every
+# supported filesystem; the pid is created inside it with noclobber and its
+# start time follows. A real directory is its own owner record, which the
+# readers and stale-owner recovery already accept, and fm_lock_owner_matches
+# carries the ownership check for both shapes. Mutual exclusion is unchanged:
+# exactly one ln or mkdir can create the lock name, and a live pid is never
+# reclaimed. POSIX publication and its diagnostics are unchanged.
+#
 # The trusted id itself is recorded beside the lock in state/.lock-session, a
 # sidecar written only here and only under the claim lock: refreshed on every
 # confirmed-own acquisition, including the early already-mine exit that waits
